@@ -40,16 +40,21 @@ Copy `.env.example` to `.env` and adjust as needed.
 ```dotenv
 WHISPLAY_AIRPLAY_NAME=Whisplay AirPlay
 ALSA_OUTPUT_DEVICE=playback
-ALSA_MIXER_DEVICE=whisplaysound
-ALSA_MIXER_CONTROL=speaker
 SHAIRPORT_LOG_LEVEL=0
 SHAIRPORT_INTERPOLATION=basic
 SHAIRPORT_OUTPUT_RATE=44100
 SHAIRPORT_OUTPUT_FORMAT=S16
 SHAIRPORT_IGNORE_VOLUME_CONTROL=false
+SHAIRPORT_BUFFER_SECONDS=1.0
 ```
 
 For the current Whisplay driver, `playback` is preferred over `hw:whisplaysound,0` because it uses the shared ALSA `dmix` route from the driver package. Legacy cards fall back to `plughw:CARD=...` automatically.
+
+By default, AirPlay volume uses shairport-sync software attenuation. The Whisplay `speaker` mixer is useful for system-level volume and tests, but it does not expose a dB scale and should not be bound as the shairport-sync hardware mixer.
+
+The generated ALSA config disables precision timing for compatibility with the Whisplay `playback` dmix route.
+
+Playback state on the LCD is driven by shairport-sync session hooks, so the UI and LED can update even when verbose AirPlay logs are disabled.
 
 ## Notes
 

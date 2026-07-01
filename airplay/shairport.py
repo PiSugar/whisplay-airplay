@@ -1,11 +1,14 @@
 import asyncio
 import base64
 import logging
+import math
 import os
 import re
 import shutil
 import signal
 import shlex
+import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from xml.etree import ElementTree
@@ -15,7 +18,6 @@ import config
 log = logging.getLogger("airplay")
 
 _CONNECTION_RE = re.compile(r"(?:connection from|new connection from|client[: ]+)([^,\n]+)", re.I)
-_VOLUME_RE = re.compile(r"(?:volume|pvol)[^-\d]*(?P<value>-?\d+(?:\.\d+)?)", re.I)
 
 
 @dataclass
@@ -23,6 +25,7 @@ class AirPlayEvent:
     kind: str
     device_name: str | None = None
     volume: int | None = None
+    level: int | None = None
     raw: str = ""
 
 
@@ -31,15 +34,26 @@ class ShairportManager:
         self.queue = queue
         self.process: asyncio.subprocess.Process | None = None
         self._metadata_task: asyncio.Task | None = None
+        self._event_hook_task: asyncio.Task | None = None
+        self._audio_task: asyncio.Task | None = None
         self._stderr_task: asyncio.Task | None = None
+        self._aplay_process: subprocess.Popen | None = None
+        self._logged_pcm_level = False
         self._running = False
 
     async def start(self):
         config.RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
         self._prepare_fifo(config.METADATA_FIFO_PATH)
+        self._prepare_fifo(config.EVENT_FIFO_PATH)
+        self._prepare_fifo(config.PCM_FIFO_PATH)
+        self._write_event_hook(config.EVENT_HOOK_PATH)
         self._write_config(config.SHAIRPORT_CONFIG_PATH)
         self._kill_stale_instances()
         self._running = True
+        self._event_hook_task = asyncio.create_task(self._event_hook_loop())
+        if config.SHAIRPORT_OUTPUT_BACKEND == "pipe":
+            self._start_aplay()
+            self._audio_task = asyncio.create_task(self._audio_loop())
         self.process = await asyncio.create_subprocess_exec(
             config.SHAIRPORT_BIN,
             "-c",
@@ -55,9 +69,12 @@ class ShairportManager:
 
     async def stop(self):
         self._running = False
-        for task in (self._metadata_task, self._stderr_task):
+        for task in (self._metadata_task, self._event_hook_task, self._audio_task, self._stderr_task):
             if task:
                 task.cancel()
+        self._poke_fifo(config.METADATA_FIFO_PATH)
+        self._poke_fifo(config.EVENT_FIFO_PATH)
+        self._poke_fifo(config.PCM_FIFO_PATH)
         if self.process and self.process.returncode is None:
             self._send_process_signal(signal.SIGTERM)
             try:
@@ -65,6 +82,7 @@ class ShairportManager:
             except asyncio.TimeoutError:
                 self._send_process_signal(signal.SIGKILL)
                 await self.process.wait()
+        self._stop_aplay()
 
     async def wait(self):
         if not self.process:
@@ -80,15 +98,42 @@ class ShairportManager:
             path.unlink()
         os.mkfifo(path)
 
+    def _poke_fifo(self, path: Path):
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
+        except OSError:
+            return
+        try:
+            os.write(fd, b"\n")
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+
+    def _write_event_hook(self, path: Path):
+        path.write_text(
+            f"""#!/usr/bin/env sh
+printf '%s\\n' "$1" > "{_escape(str(config.EVENT_FIFO_PATH))}"
+""",
+            encoding="utf-8",
+        )
+        path.chmod(0o755)
+
     def _write_config(self, path: Path):
         if config.SHAIRPORT_CONFIG_TEMPLATE:
             shutil.copyfile(config.SHAIRPORT_CONFIG_TEMPLATE, path)
             return
+        mixer_lines = ""
+        if config.ALSA_MIXER_CONTROL:
+            mixer_lines += f'    mixer_control_name = "{_escape(config.ALSA_MIXER_CONTROL)}";\n'
+        if config.ALSA_MIXER_DEVICE:
+            mixer_lines += f'    mixer_device = "{_escape(config.ALSA_MIXER_DEVICE)}";\n'
         path.write_text(
             f"""
 general =
 {{
     name = "{_escape(config.AIRPLAY_NAME)}";
+    output_backend = "{_escape(config.SHAIRPORT_OUTPUT_BACKEND)}";
     interpolation = "{_escape(config.SHAIRPORT_INTERPOLATION)}";
     ignore_volume_control = "{'yes' if config.SHAIRPORT_IGNORE_VOLUME_CONTROL else 'no'}";
     audio_backend_buffer_desired_length_in_seconds = {config.SHAIRPORT_BUFFER_SECONDS};
@@ -100,13 +145,26 @@ diagnostics =
     log_verbosity = {config.SHAIRPORT_LOG_LEVEL};
 }};
 
+sessioncontrol =
+{{
+    run_this_before_entering_active_state = "{_escape(str(config.EVENT_HOOK_PATH))} connect";
+    run_this_after_exiting_active_state = "{_escape(str(config.EVENT_HOOK_PATH))} disconnect";
+    run_this_before_play_begins = "{_escape(str(config.EVENT_HOOK_PATH))} play";
+    run_this_after_play_ends = "{_escape(str(config.EVENT_HOOK_PATH))} stop";
+}};
+
 alsa =
 {{
     output_device = "{_escape(config.ALSA_OUTPUT_DEVICE)}";
-    mixer_control_name = "{_escape(config.ALSA_MIXER_CONTROL)}";
-    mixer_device = "{_escape(config.ALSA_MIXER_DEVICE)}";
+{mixer_lines.rstrip()}
     output_rate = {_shairport_number_or_string(config.SHAIRPORT_OUTPUT_RATE)};
     output_format = "{_escape(config.SHAIRPORT_OUTPUT_FORMAT)}";
+    use_precision_timing = "no";
+}};
+
+pipe =
+{{
+    name = "{_escape(str(config.PCM_FIFO_PATH))}";
 }};
 
 metadata =
@@ -167,6 +225,101 @@ metadata =
                 log.debug("metadata read failed: %s", exc)
                 await asyncio.sleep(0.5)
 
+    async def _event_hook_loop(self):
+        while self._running:
+            try:
+                await asyncio.to_thread(self._read_event_fifo_once)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.debug("event hook read failed: %s", exc)
+                await asyncio.sleep(0.5)
+
+    def _start_aplay(self):
+        cmd = [
+            "aplay",
+            "-q",
+            "-t",
+            "raw",
+            "-D",
+            config.ALSA_OUTPUT_DEVICE,
+            "-f",
+            "S16_LE",
+            "-r",
+            str(config.SHAIRPORT_OUTPUT_RATE),
+            "-c",
+            "2",
+        ]
+        self._aplay_process = subprocess.Popen(cmd, stdin=subprocess.PIPE, bufsize=0)
+
+    def _stop_aplay(self):
+        if not self._aplay_process:
+            return
+        process = self._aplay_process
+        self._aplay_process = None
+        if process.stdin:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+
+    async def _audio_loop(self):
+        while self._running:
+            try:
+                await asyncio.to_thread(self._read_audio_fifo_once)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.debug("audio fifo read failed: %s", exc)
+                await asyncio.sleep(0.2)
+
+    def _read_audio_fifo_once(self):
+        last_level = -1
+        last_emit = 0.0
+        with open(config.PCM_FIFO_PATH, "rb", buffering=0) as handle:
+            while self._running:
+                chunk = handle.read(8192)
+                if not chunk:
+                    return
+                process = self._aplay_process
+                if process and process.stdin and process.poll() is None:
+                    try:
+                        process.stdin.write(chunk)
+                    except (BrokenPipeError, OSError):
+                        self._stop_aplay()
+                        self._start_aplay()
+                level = _pcm_level(chunk)
+                if level > 0 and not self._logged_pcm_level:
+                    self._logged_pcm_level = True
+                    log.info("detected live PCM audio level=%s", level)
+                now = time.monotonic()
+                if level != last_level and now - last_emit >= 0.05:
+                    self.queue.put_nowait(AirPlayEvent("level", level=level, raw="pcm"))
+                    last_level = level
+                    last_emit = now
+
+    def _read_event_fifo_once(self):
+        with open(config.EVENT_FIFO_PATH, "r", encoding="utf-8", errors="ignore") as handle:
+            for line in handle:
+                if not self._running:
+                    return
+                text = line.strip().lower()
+                if text == "play":
+                    self._logged_pcm_level = False
+                    self.queue.put_nowait(AirPlayEvent("play", device_name="AirPlay", raw=text))
+                elif text == "stop":
+                    self.queue.put_nowait(AirPlayEvent("stop", raw=text))
+                elif text == "connect":
+                    self.queue.put_nowait(AirPlayEvent("device", device_name="AirPlay", raw=text))
+                elif text == "disconnect":
+                    log.debug("ignoring Shairport active-state exit as a disconnect")
+
     def _read_fifo_once(self):
         with open(config.METADATA_FIFO_PATH, "r", encoding="utf-8", errors="ignore") as handle:
             buffer = []
@@ -218,7 +371,7 @@ metadata =
             if volume is not None:
                 return AirPlayEvent("volume", volume=volume, raw=text)
 
-        if code in {"snam", "asal", "asar", "minm"} and decoded:
+        if code in {"snam"} and decoded:
             return AirPlayEvent("device", device_name=decoded.strip(), raw=text)
 
         return self._parse_text_event(sample)
@@ -285,8 +438,6 @@ metadata =
         if not match:
             match = re.search(r"\bvolume:\s*(?P<value>-?\d+(?:\.\d+)?)\s*dB\b", text, re.I)
         if not match:
-            match = _VOLUME_RE.search(text)
-        if not match:
             return None
         value = float(match.group("value"))
         if value <= 0 and value >= -30:
@@ -331,6 +482,23 @@ def _clean_connection_name(value: str) -> str:
     if ":" in text and all(part for part in text.replace(".", ":").split(":")):
         return "AirPlay"
     return text or "AirPlay"
+
+
+def _pcm_level(chunk: bytes) -> int:
+    if len(chunk) < 2:
+        return 0
+    even = len(chunk) - (len(chunk) % 2)
+    samples = memoryview(chunk[:even]).cast("h")
+    if not samples:
+        return 0
+    total = 0
+    for sample in samples:
+        total += sample * sample
+    rms = math.sqrt(total / len(samples)) / 32768.0
+    if rms <= 0:
+        return 0
+    level = int(min(100, max(0, (math.log10(1 + rms * 28) / math.log10(29)) * 100)))
+    return level
 
 
 def _is_important_log_line(text: str) -> bool:
